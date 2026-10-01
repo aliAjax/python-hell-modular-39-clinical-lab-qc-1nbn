@@ -140,6 +140,72 @@ class SQLiteRepository:
             connection.close()
         return self.get_entity(entity_id)
 
+    def recall_result_batch(self, batch_id, rejudgment_id, reason, expected_version, actor_id, actor_role):
+        """Atomically revoke a released batch back to intercepted under a re-judgment.
+
+        Returns the updated batch, or None when the batch is already intercepted /
+        already recalled by this re-judgment (idempotent skip). Raises ConflictError
+        on an optimistic-lock mismatch.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM entities WHERE id = ?", (batch_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + batch_id)
+            batch = self._entity_from_row(row)
+            if batch["status"] != "released":
+                return None
+            review = batch["data"].get("rejudgment_review")
+            if isinstance(review, dict) and review.get("rejudgment_id") == rejudgment_id:
+                return None
+            if expected_version is not None and batch["version"] != int(expected_version):
+                raise ConflictError(
+                    "version conflict: expected %s, found %s"
+                    % (expected_version, batch["version"])
+                )
+            data = dict(batch["data"])
+            data["rejudgment_review"] = {
+                "rejudgment_id": rejudgment_id,
+                "status": "pending",
+                "recalled_at": now,
+                "reason": reason,
+                "original_released_by": data.get("released_by"),
+                "original_reviewer_id": data.get("reviewer_id"),
+                "original_released_at": data.get("released_at"),
+            }
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET status = 'intercepted', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ? AND version = ?",
+                (payload, now, batch_id, batch["version"]),
+            )
+            connection.execute(
+                "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                "VALUES (?, ?, ?, 'recall', 'released', 'intercepted', ?, ?)",
+                (
+                    batch_id,
+                    actor_id,
+                    actor_role,
+                    json.dumps(
+                        {"rejudgment_id": rejudgment_id, "reason": reason},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    now,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(batch_id)
+
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
             connection.execute(

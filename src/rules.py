@@ -1,4 +1,10 @@
+from datetime import datetime, timezone
+
 from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+
+
+def _utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _find_one(lookup, kind, field, value):
@@ -56,6 +62,29 @@ def evaluate_qc(history, value, target, sd, config=None):
             "trend_n": trend_n,
         },
     }
+
+
+def validate_rule_config(config):
+    """Normalize and validate an assay rule_config object."""
+    if not isinstance(config, dict):
+        raise ValidationError("rule_config must be an object")
+    out = dict(config)
+
+    def number(key, default, minimum=None):
+        raw = config.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValidationError("rule_config.%s must be numeric" % key)
+        if minimum is not None and value < minimum:
+            raise ValidationError("rule_config.%s must be >= %s" % (key, minimum))
+        return value
+
+    out["limit_sd"] = number("limit_sd", 3.0, 0.01)
+    out["consecutive_sd"] = number("consecutive_sd", 1.0, 0.01)
+    out["consecutive_n"] = int(number("consecutive_n", 4, 2))
+    out["trend_n"] = int(number("trend_n", 4, 2))
+    return out
 
 
 def unrecovered_rejection(batches):
@@ -194,6 +223,20 @@ def _validate_correct(actor, entity, data, lookup):
     return {"correction_history": history}
 
 
+def _validate_reconfirm(actor, entity, data, lookup):
+    review = entity["data"].get("rejudgment_review")
+    if not isinstance(review, dict) or review.get("status") != "pending":
+        raise InvalidTransition("batch is not pending re-judgment review")
+    return {
+        "rejudgment_review": {
+            **review,
+            "status": "confirmed",
+            "confirmed_by": actor.user_id,
+            "confirmed_at": _utcnow(),
+        }
+    }
+
+
 class RuleEngine:
     ALIASES = {
         "assays": "assay",
@@ -201,6 +244,7 @@ class RuleEngine:
         "instruments": "instrument",
         "qc_runs": "qc_run",
         "result_batches": "result_batch",
+        "rejudgments": "rejudgment",
     }
     INITIAL_STATUS = {
         "assay": "active",
@@ -239,6 +283,7 @@ class RuleEngine:
             "retest": (("intercepted",), "waiting"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
+            "reconfirm": (("intercepted",), "released"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
         },
     }
@@ -292,6 +337,7 @@ class RuleEngine:
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
+        "reconfirm": ("supervisor", "admin"),
     }
     CUSTOM_CREATE = {
         "assay": _validate_assay,
@@ -304,6 +350,7 @@ class RuleEngine:
         ("qc_run", "evaluate"): _validate_evaluate,
         ("result_batch", "release"): _validate_release,
         ("result_batch", "retest"): _validate_qc_retest,
+        ("result_batch", "reconfirm"): _validate_reconfirm,
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,

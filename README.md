@@ -21,7 +21,18 @@ python3 app.py --db ./data.db --port 8339
 
 ## 核心对象
 
-`assay`为检测项目，`qc_lot`为质控品批次，`instrument`为仪器，`qc_run`为质控结果，`result_batch`为患者结果批次。
+`assay`为检测项目，`qc_lot`为质控品批次，`instrument`为仪器，`qc_run`为质控结果，`result_batch`为患者结果批次，`rejudgment`为规则变更触发的受控重判任务。
+
+## 受控重判
+
+检测项目规则变更（`POST /api/assays/<id>/actions`，`action=change_rules`，携带新的`rule_config`）会更新项目规则并创建一个`rejudgment`重判任务。重判按新规则逐条重算该项目的历史质控结果：
+
+- 按新规则判为失控的已放行批次，**收回放行并回到拦截**（`recall`），同时保留原放行审核人与放行时间，批次进入待复核（`rejudgment_review.status=pending`）。
+- 仍在控的批次**保留原放行时间与审核人**，不做任何改动。
+
+审核员对拦截批次做复查确认（`POST /api/result_batches/<id>/actions`，`action=reconfirm`）后批次重新放行。复查确认使用乐观锁（`expected_version`）：两名审核员同时提交同一批次时只有一方生效，另一方收到`409 ConflictError`，可通过`GET /api/reviews/pending`查看待复核项的当前状态。
+
+重判任务记录断点（`checkpoint_index`），每个质控结果处理后立即落盘。写入失败后任务置为`failed`，可通过`POST /api/rejudgments/<id>/actions`（`action=run`）从断点重试：已收回的批次按重判任务幂等跳过，**不会重复收回，也不会重复写操作记录**。
 
 ## 接口
 
@@ -30,6 +41,10 @@ python3 app.py --db ./data.db --port 8339
 - `GET /api/entities/<id>`
 - `POST /api/<kind>`
 - `POST /api/entities/<id>/actions`
+- `POST /api/assays/<id>/actions`（`change_rules`）
+- `POST /api/rejudgments/<id>/actions`（`run`）
+- `POST /api/result_batches/<id>/actions`（`reconfirm`）
+- `GET /api/reviews/pending`（可用`?rejudgment_id=`过滤）
 - `GET /api/audit`
 
 身份通过`X-User-Id`和`X-Role`请求头传入。可选`Idempotency-Key`防止重复创建。

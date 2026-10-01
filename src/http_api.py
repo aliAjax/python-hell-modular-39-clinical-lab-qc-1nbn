@@ -84,6 +84,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "reviews", "pending"]:
+                    query = parse_qs(parsed.query)
+                    rejudgment_id = query.get("rejudgment_id", [None])[0]
+                    return self._send(200, {"items": service.pending_reviews(rejudgment_id)})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -103,6 +107,23 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 4 and parts[:2] == ["api", "assays"] and parts[3] == "actions":
+                    body = self._body()
+                    if body.get("action") == "change_rules":
+                        data = body.get("data", body)
+                        return self._send(
+                            200,
+                            service.change_assay_rules(
+                                actor,
+                                parts[2],
+                                data.get("rule_config"),
+                                body.get("expected_version"),
+                            ),
+                        )
+                if len(parts) == 4 and parts[:2] == ["api", "rejudgments"] and parts[3] == "actions":
+                    body = self._body()
+                    if body.get("action") == "run":
+                        return self._send(200, service.run_rejudgment(actor, parts[2]))
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
