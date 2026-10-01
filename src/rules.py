@@ -1,4 +1,31 @@
-from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError
+from .domain import ConflictError, InvalidTransition, PermissionDenied, ValidationError, utcnow
+
+RULE_CONFIG_FIELDS = ("limit_sd", "consecutive_n", "consecutive_sd", "trend_n")
+
+
+def clean_rule_config(raw):
+    """Validate and normalise a QC rule configuration; unknown keys are dropped."""
+    raw = dict(raw or {})
+    cleaned = {}
+    try:
+        if "limit_sd" in raw:
+            cleaned["limit_sd"] = float(raw["limit_sd"])
+        if "consecutive_n" in raw:
+            cleaned["consecutive_n"] = int(raw["consecutive_n"])
+        if "consecutive_sd" in raw:
+            cleaned["consecutive_sd"] = float(raw["consecutive_sd"])
+        if "trend_n" in raw:
+            cleaned["trend_n"] = int(raw["trend_n"])
+    except (TypeError, ValueError):
+        raise ValidationError("rule_config values have invalid types")
+    if cleaned.get("limit_sd", 3.0) <= 0:
+        raise ValidationError("rule_config limit_sd must be positive")
+    if cleaned.get("consecutive_sd", 1.0) <= 0:
+        raise ValidationError("rule_config consecutive_sd must be positive")
+    for field in ("consecutive_n", "trend_n"):
+        if cleaned.get(field, 4) < 2:
+            raise ValidationError("rule_config %s must be at least 2" % field)
+    return cleaned
 
 
 def _find_one(lookup, kind, field, value):
@@ -6,6 +33,33 @@ def _find_one(lookup, kind, field, value):
         return None
     rows = lookup(kind, field, value) or []
     return rows[0] if rows else None
+
+
+def evaluate_run_entity(run, lookup, rule_config=None):
+    """Re-evaluate a qc_run entity; returns the evaluate_qc result dict."""
+    assay = _find_one(lookup, "assay", "id", run["data"].get("assay_id"))
+    lot = _find_one(lookup, "qc_lot", "id", run["data"].get("qc_lot_id"))
+    if not assay or not lot:
+        raise ValidationError("assay or qc lot disappeared")
+    previous = []
+    peers = [
+        item
+        for item in (lookup("qc_run", "instrument_id", run["data"].get("instrument_id")) or [])
+        if item["id"] != run["id"]
+        and item["status"] in ("accepted", "rejected")
+        and item["data"].get("qc_lot_id") == run["data"].get("qc_lot_id")
+        and str(item["data"].get("run_at", "")) < str(run["data"].get("run_at", ""))
+    ]
+    peers.sort(key=lambda item: (str(item["data"].get("run_at", "")), item["id"]))
+    previous = [item["data"]["value"] for item in peers]
+    config = rule_config if rule_config is not None else assay["data"].get("rule_config")
+    return evaluate_qc(
+        previous,
+        run["data"].get("value"),
+        lot["data"].get("target"),
+        lot["data"].get("sd"),
+        config,
+    )
 
 
 def calibration_is_valid(calibration_due, as_of):
@@ -71,7 +125,8 @@ def _validate_assay(actor, data, lookup):
     if low >= high:
         raise ValidationError("allowed_low must be less than allowed_high")
     return {
-        "rule_config": dict(data.get("rule_config") or {}),
+        "rule_config": clean_rule_config(data.get("rule_config")),
+        "rule_version": 1,
     }
 
 
@@ -125,25 +180,7 @@ def _validate_result_batch(actor, data, lookup):
 
 
 def _validate_evaluate(actor, entity, data, lookup):
-    assay = _find_one(lookup, "assay", "id", entity["data"].get("assay_id"))
-    lot = _find_one(lookup, "qc_lot", "id", entity["data"].get("qc_lot_id"))
-    if not assay or not lot:
-        raise ValidationError("assay or qc lot disappeared")
-    previous = []
-    for run in lookup("qc_run", "instrument_id", entity["data"].get("instrument_id")) or []:
-        if run["id"] == entity["id"] or run["status"] not in ("accepted", "rejected"):
-            continue
-        if run["data"].get("qc_lot_id") != entity["data"].get("qc_lot_id"):
-            continue
-        if str(run["data"].get("run_at", "")) < str(entity["data"].get("run_at", "")):
-            previous.append(run["data"]["value"])
-    result = evaluate_qc(
-        previous,
-        entity["data"].get("value"),
-        lot["data"].get("target"),
-        lot["data"].get("sd"),
-        assay["data"].get("rule_config"),
-    )
+    result = evaluate_run_entity(entity, lookup)
     if not result["accepted"] and not data.get("reject_reason"):
         result["reject_reason"] = "quality control rule violation"
     result["_next_status"] = "accepted" if result["accepted"] else "rejected"
@@ -165,7 +202,38 @@ def _validate_release(actor, entity, data, lookup):
             active_holds.append(batch)
     if active_holds:
         raise ConflictError("an intercepted result batch must be resolved first")
-    return {"released_by": actor.user_id}
+    return {"released_by": actor.user_id, "released_at": utcnow()}
+
+
+def _validate_change_rules(actor, entity, data, lookup):
+    new_config = clean_rule_config(data.get("rule_config"))
+    old_config = dict(entity["data"].get("rule_config") or {})
+    if new_config == old_config:
+        raise ValidationError("rule_config is unchanged")
+    return {
+        "_patch": {
+            "rule_config": new_config,
+            "rule_version": int(entity["data"].get("rule_version", 1)) + 1,
+        }
+    }
+
+
+def _validate_reconfirm(actor, entity, data, lookup):
+    """Reviewer completes the recheck of a batch withdrawn by controlled rejudgment."""
+    if entity["status"] != "intercepted" or entity["data"].get("review_state") != "pending":
+        raise InvalidTransition("batch is not awaiting recheck")
+    effective_run_id = entity["data"].get("replacement_run_id") or entity["data"].get("qc_run_id")
+    run = _find_one(lookup, "qc_run", "id", effective_run_id)
+    if not run or run["status"] != "accepted":
+        raise ConflictError("batch can only be reconfirmed with an accepted QC run")
+    return {
+        "_next_status": "released",
+        "_patch": {
+            "review_state": "confirmed",
+            "reconfirmed_by": actor.user_id,
+            "reconfirmed_at": utcnow(),
+        },
+    }
 
 
 def _validate_qc_retest(actor, entity, data, lookup):
@@ -208,11 +276,13 @@ class RuleEngine:
         "instrument": "ready",
         "qc_run": "pending",
         "result_batch": "waiting",
+        "rejudgment": "pending",
     }
     TRANSITIONS = {
         "assay": {
             "suspend": (("active",), "suspended"),
             "restore": (("suspended",), "active"),
+            "change_rules": (("active",), "active"),
         },
         "qc_lot": {
             "activate": (("registered", "suspended"), "active"),
@@ -236,10 +306,14 @@ class RuleEngine:
         "result_batch": {
             "release": (("waiting",), "released"),
             "intercept": (("waiting",), "intercepted"),
-            "retest": (("intercepted",), "waiting"),
+            "retest": (("intercepted",), "intercepted"),
             "investigate": (("intercepted",), "investigating"),
             "resolve": (("investigating",), "resolved"),
+            "reconfirm": (("intercepted",), "released"),
             "correct": (("waiting", "intercepted", "investigating", "released", "resolved"), "waiting"),
+        },
+        "rejudgment": {
+            "retry": (("pending", "failed"), "running"),
         },
     }
     CREATE_REQUIRED = {
@@ -267,7 +341,10 @@ class RuleEngine:
         ("result_batch", "retest"): ("replacement_run_id", "reason"),
         ("result_batch", "investigate"): ("reason",),
         ("result_batch", "resolve"): ("resolution",),
+        ("result_batch", "reconfirm"): ("reviewer_id",),
         ("result_batch", "correct"): ("reason",),
+        ("assay", "change_rules"): ("rule_config", "reason"),
+        ("rejudgment", "retry"): (),
     }
     CREATE_ROLES = {
         "assay": ("supervisor", "admin"),
@@ -291,6 +368,9 @@ class RuleEngine:
         "resolve": ("supervisor", "admin"),
         "correct": ("supervisor", "admin"),
         "release": ("supervisor", "admin"),
+        "reconfirm": ("supervisor", "admin"),
+        "change_rules": ("supervisor", "admin"),
+        "retry": ("supervisor", "admin"),
         "intercept": ("operator", "supervisor", "admin"),
     }
     CUSTOM_CREATE = {
@@ -307,6 +387,8 @@ class RuleEngine:
         ("qc_lot", "switch_in"): _validate_switch_lot,
         ("qc_run", "correct"): _validate_correct,
         ("result_batch", "correct"): _validate_correct,
+        ("assay", "change_rules"): _validate_change_rules,
+        ("result_batch", "reconfirm"): _validate_reconfirm,
     }
 
     def normalize_kind(self, kind):
@@ -354,6 +436,9 @@ class RuleEngine:
         extra = custom(actor, entity, data, lookup) if custom else {}
         if extra.get("_next_status"):
             next_status = extra.pop("_next_status")
+        forced_patch = extra.pop("_patch", None)
+        if forced_patch is not None:
+            return next_status, dict(forced_patch)
         patch = dict(data)
         if extra:
             patch.update(extra)

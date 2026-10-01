@@ -54,6 +54,13 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS rejudgment_ledger (
+                    rejudgment_id TEXT NOT NULL,
+                    entity_id TEXT NOT NULL,
+                    disposition TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(rejudgment_id, entity_id)
+                );
             """)
 
     @staticmethod
@@ -195,6 +202,109 @@ class SQLiteRepository:
                 "VALUES (?, ?, ?, ?)",
                 (actor_id, idem_key, entity_id, utcnow()),
             )
+
+    def apply_rejudgment_step(
+        self,
+        rejudgment_id,
+        target_id,
+        disposition,
+        status=None,
+        data=None,
+        audit=None,
+        record_version=None,
+        record_data=None,
+        record_status=None,
+    ):
+        """Record one rejudgment target, atomically with its entity write + audit
+        and the rejudgment checkpoint advancement.
+
+        Returns True when this call performs the write, False when the target was
+        already recorded (a previous attempt completed it), so retries never
+        withdraw a batch twice or duplicate an audit entry.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT 1 FROM rejudgment_ledger WHERE rejudgment_id = ? AND entity_id = ?",
+                (rejudgment_id, target_id),
+            ).fetchone()
+            if existing:
+                connection.rollback()
+                return False
+            if status is not None:
+                payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (target_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + target_id)
+                current_version = int(row["version"])
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (status, payload, now, target_id, current_version),
+                )
+            if audit is not None:
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        audit["entity_id"],
+                        audit["actor_id"],
+                        audit["actor_role"],
+                        audit["action"],
+                        audit["from_status"],
+                        audit["to_status"],
+                        json.dumps(audit.get("detail") or {}, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO rejudgment_ledger(rejudgment_id, entity_id, disposition, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (rejudgment_id, target_id, disposition, now),
+            )
+            if record_data is not None:
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (
+                        record_status or "running",
+                        json.dumps(record_data, ensure_ascii=False, sort_keys=True),
+                        now,
+                        rejudgment_id,
+                        int(record_version),
+                    ),
+                )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def ledger_disposition(self, rejudgment_id, entity_id):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT disposition FROM rejudgment_ledger WHERE rejudgment_id = ? AND entity_id = ?",
+                (rejudgment_id, entity_id),
+            ).fetchone()
+        return row["disposition"] if row else None
+
+    def list_ledger(self, rejudgment_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT entity_id, disposition, created_at FROM rejudgment_ledger "
+                "WHERE rejudgment_id = ? ORDER BY rowid",
+                (rejudgment_id,),
+            ).fetchall()
+        return [
+            {"entity_id": row["entity_id"], "disposition": row["disposition"], "created_at": row["created_at"]}
+            for row in rows
+        ]
 
     def ping(self):
         with self._connect() as connection:

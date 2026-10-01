@@ -14,18 +14,27 @@
 <body>
 <main>
   <h1>临床实验室质量控制与结果拦截</h1>
-  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
+  <p>质控规则、仪器校准、失控调查和患者结果批次通过JSON接口管理。规则变更走受控重判：按新规则失控的已放行批次被收回拦截、进入待复核队列，复查确认后才重新放行。</p>
+  <p><button onclick="checkHealth()">检查服务状态</button>
+     <button onclick="loadQueue()">查看待复核队列</button></p>
   <pre id="result">等待操作</pre>
   <pre>GET  /health
 GET  /api/&lt;kind&gt;
 POST /api/&lt;kind&gt;
 POST /api/entities/&lt;id&gt;/actions
-GET  /api/audit</pre>
+GET  /api/audit
+POST /api/entities/&lt;assay_id&gt;/actions   {action: change_rules}
+POST /api/rejudgments/&lt;id&gt;/retry
+GET  /api/rejudgments/&lt;id&gt;/items
+GET  /api/review_queue</pre>
 </main>
 <script>
 async function checkHealth() {
   const response = await fetch('/health');
+  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+}
+async function loadQueue() {
+  const response = await fetch('/api/review_queue');
   document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
 }
 </script>

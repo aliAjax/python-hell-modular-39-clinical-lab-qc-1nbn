@@ -84,6 +84,10 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if parts == ["api", "review_queue"]:
+                    return self._send(200, {"items": service.pending_reviews()})
+                if len(parts) == 4 and parts[:2] == ["api", "rejudgments"] and parts[3] == "items":
+                    return self._send(200, {"items": service.rejudgment_items(parts[2])})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
                 if len(parts) >= 2 and parts[0] == "api":
@@ -103,6 +107,16 @@ def create_handler(service, rules, static_dir):
                 parsed = urlparse(self.path)
                 parts = [part for part in parsed.path.split("/") if part]
                 actor = self._actor()
+                if len(parts) == 4 and parts[:2] == ["api", "rejudgments"] and parts[3] == "retry":
+                    body = self._body()
+                    return self._send(
+                        200,
+                        service.retry_rejudgment(
+                            actor,
+                            parts[2],
+                            body.pop("expected_version", None),
+                        ),
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     body = self._body()
                     action = body.pop("action", None)
